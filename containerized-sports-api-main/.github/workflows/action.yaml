@@ -1,0 +1,148 @@
+name: Deploy ECS Task with ALB
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY_NAME: sports-api
+  ECS_CLUSTER_NAME: my-ecs-cluster
+  ECS_SERVICE_NAME: my-ecs-service
+  TASK_FAMILY: my-task-family
+  CONTAINER_NAME: my-container
+  CONTAINER_PORT: 80
+  ALB_NAME: my-ecs-alb
+  TARGET_GROUP_NAME: my-target-group
+  VPC_ID: vpc-abc12345
+  SUBNETS: subnet-abc12345,subnet-def67890
+  SECURITY_GROUP: sg-abc12345
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+    # Step 1: Checkout Code
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    # Step 2: Configure AWS Credentials
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    # Step 3: Login to Amazon ECR
+    - name: Log in to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v1
+
+    # Step 4: Build and Push Docker Image
+    - name: Build and push Docker image to ECR
+      run: |
+        REPOSITORY_URI=$(aws ecr describe-repositories --repository-names $ECR_REPOSITORY_NAME --query "repositories[0].repositoryUri" --output text 2>/dev/null || aws ecr create-repository --repository-name $ECR_REPOSITORY_NAME --query "repository.repositoryUri" --output text)
+        docker build -t $ECR_REPOSITORY_NAME .
+        docker tag $ECR_REPOSITORY_NAME:latest $REPOSITORY_URI:latest
+        docker push $REPOSITORY_URI:latest
+      env:
+        ECR_REPOSITORY_NAME: ${{ env.ECR_REPOSITORY_NAME }}
+
+    # Step 5: Create or Update ECS Task Definition
+    - name: Register ECS Task Definition
+      id: task-def
+      run: |
+        TASK_DEFINITION=$(cat <<EOF
+        {
+          "family": "$TASK_FAMILY",
+          "executionRoleArn": "arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/ecsTaskExecutionRole",
+          "networkMode": "awsvpc",
+          "containerDefinitions": [
+            {
+              "name": "$CONTAINER_NAME",
+              "image": "$(aws ecr describe-repositories --repository-names $ECR_REPOSITORY_NAME --query "repositories[0].repositoryUri" --output text):latest",
+              "memory": 512,
+              "cpu": 256,
+              "portMappings": [
+                {
+                  "containerPort": $CONTAINER_PORT,
+                  "hostPort": 0,
+                  "protocol": "tcp"
+                }
+              ]
+            }
+          ],
+          "requiresCompatibilities": ["FARGATE"],
+          "cpu": "256",
+          "memory": "512"
+        }
+        EOF
+        )
+        echo "$TASK_DEFINITION" > task-definition.json
+        aws ecs register-task-definition --cli-input-json file://task-definition.json
+      env:
+        TASK_FAMILY: ${{ env.TASK_FAMILY }}
+        ECR_REPOSITORY_NAME: ${{ env.ECR_REPOSITORY_NAME }}
+        CONTAINER_NAME: ${{ env.CONTAINER_NAME }}
+        CONTAINER_PORT: ${{ env.CONTAINER_PORT }}
+
+    # Step 6: Create or Update ECS Service with ALB
+    - name: Create or Update ECS Service
+      run: |
+        TARGET_GROUP_ARN=$(aws elbv2 describe-target-groups --names $TARGET_GROUP_NAME --query "TargetGroups[0].TargetGroupArn" --output text 2>/dev/null || aws elbv2 create-target-group \
+          --name $TARGET_GROUP_NAME \
+          --protocol HTTP \
+          --port $CONTAINER_PORT \
+          --vpc-id $VPC_ID \
+          --target-type ip \
+          --query "TargetGroups[0].TargetGroupArn" \
+          --output text)
+
+        ALB_ARN=$(aws elbv2 describe-load-balancers --names $ALB_NAME --query "LoadBalancers[0].LoadBalancerArn" --output text 2>/dev/null || aws elbv2 create-load-balancer \
+          --name $ALB_NAME \
+          --subnets $SUBNETS \
+          --security-groups $SECURITY_GROUP \
+          --scheme internet-facing \
+          --type application \
+          --query "LoadBalancers[0].LoadBalancerArn" \
+          --output text)
+
+        LISTENER_EXISTS=$(aws elbv2 describe-listeners --load-balancer-arn $ALB_ARN --query "Listeners[?Port==`80`]" --output text || echo "NONE")
+        if [ "$LISTENER_EXISTS" == "NONE" ]; then
+          aws elbv2 create-listener \
+            --load-balancer-arn $ALB_ARN \
+            --protocol HTTP \
+            --port 80 \
+            --default-actions Type=forward,TargetGroupArn=$TARGET_GROUP_ARN
+        fi
+
+        SERVICE_EXISTS=$(aws ecs describe-services --cluster $ECS_CLUSTER_NAME --services $ECS_SERVICE_NAME --query "services[0].status" --output text 2>/dev/null || echo "NONE")
+        if [ "$SERVICE_EXISTS" == "NONE" ]; then
+          aws ecs create-service \
+            --cluster $ECS_CLUSTER_NAME \
+            --service-name $ECS_SERVICE_NAME \
+            --task-definition $TASK_FAMILY \
+            --desired-count 2 \
+            --launch-type FARGATE \
+            --network-configuration "awsvpcConfiguration={subnets=[$SUBNETS],securityGroups=[$SECURITY_GROUP],assignPublicIp=ENABLED}" \
+            --load-balancers "targetGroupArn=$TARGET_GROUP_ARN,containerName=$CONTAINER_NAME,containerPort=$CONTAINER_PORT"
+        else
+          aws ecs update-service \
+            --cluster $ECS_CLUSTER_NAME \
+            --service $ECS_SERVICE_NAME \
+            --task-definition $TASK_FAMILY
+        fi
+      env:
+        ALB_NAME: ${{ env.ALB_NAME }}
+        TARGET_GROUP_NAME: ${{ env.TARGET_GROUP_NAME }}
+        VPC_ID: ${{ env.VPC_ID }}
+        SUBNETS: ${{ env.SUBNETS }}
+        SECURITY_GROUP: ${{ env.SECURITY_GROUP }}
+        ECS_CLUSTER_NAME: ${{ env.ECS_CLUSTER_NAME }}
+        ECS_SERVICE_NAME: ${{ env.ECS_SERVICE_NAME }}
+        TASK_FAMILY: ${{ env.TASK_FAMILY }}
+        CONTAINER_NAME: ${{ env.CONTAINER_NAME }}
+        CONTAINER_PORT: ${{ env.CONTAINER_PORT }}
