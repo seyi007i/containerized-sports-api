@@ -15,7 +15,7 @@ env:
   CONTAINER_PORT: 80
   ALB_NAME: my-ecs-alb
   TARGET_GROUP_NAME: my-target-group
-  VPC_ID: vpc-abc12345
+  VPC_ID: vpc-0c1b1d8b83924b46c
   SUBNETS: subnet-abc12345,subnet-def67890
   SECURITY_GROUP: sg-abc12345
 
